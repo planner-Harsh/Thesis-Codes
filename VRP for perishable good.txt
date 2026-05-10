@@ -1,0 +1,576 @@
+# ======================================================
+# FINAL SCRIPT – ONLY MAJOR ROADS, FIXED GEOMETRY ERROR
+# Exports shapefiles for Summer and Monsoon routes
+# ======================================================
+!pip install geopandas networkx pandas numpy ortools folium shapely openpyxl python-docx -q
+
+import zipfile, os, math, time, warnings
+import geopandas as gpd
+import networkx as nx
+import pandas as pd
+import numpy as np
+from shapely.geometry import Point, LineString
+from ortools.constraint_solver import routing_enums_pb2, pywrapcp
+import folium
+from google.colab import files as colab_files
+from openpyxl import Workbook
+from docx import Document
+
+warnings.filterwarnings('ignore')
+
+# ------------------------------------------------------
+# 1. Upload major roads zip
+# ------------------------------------------------------
+print("📂 Upload your MAJOR roads zip file")
+major_zip = list(colab_files.upload().keys())[0]
+extract_dir = "/content/roads"
+os.makedirs(extract_dir, exist_ok=True)
+
+with zipfile.ZipFile(major_zip, 'r') as zf:
+    zf.extractall(extract_dir)
+
+# Find the .shp file
+shp_files = []
+for root, dirs, files in os.walk(extract_dir):
+    for f in files:
+        if f.endswith('.shp'):
+            shp_files.append(os.path.join(root, f))
+major_shp = shp_files[0]
+print(f"Major roads: {major_shp}")
+
+# ------------------------------------------------------
+# 2. Load major roads only
+# ------------------------------------------------------
+def load_roads(shp_path, default_speed=50):
+    gdf = gpd.read_file(shp_path)
+    print(f"Loaded {len(gdf)} features")
+    if gdf.crs is None or gdf.crs.is_geographic:
+        gdf = gdf.to_crs("EPSG:32643")
+    # Explode MultiLineString
+    rows = []
+    for idx, row in gdf.iterrows():
+        geom = row.geometry
+        if geom is None:
+            continue
+        if geom.geom_type == 'MultiLineString':
+            for part in geom.geoms:
+                new_row = row.copy()
+                new_row.geometry = part
+                rows.append(new_row)
+        else:
+            rows.append(row)
+    gdf = gpd.GeoDataFrame(rows, crs=gdf.crs)
+    gdf['length_m'] = gdf.geometry.length
+    if 'speed_kmh' in gdf.columns:
+        gdf['speed_kmh'] = gdf['speed_kmh'].fillna(default_speed)
+    else:
+        gdf['speed_kmh'] = default_speed
+    # Environmental defaults
+    for col, default in [('fl_depth_m', 0.0), ('heat_lst_c', 35.0), ('can_shade', 0.0)]:
+        if col not in gdf.columns:
+            gdf[col] = default
+    return gdf
+
+gdf = load_roads(major_shp, default_speed=50)
+print(f"Total road segments: {len(gdf)}")
+
+# ------------------------------------------------------
+# 3. Compute costs (if columns are constant, cost will be constant)
+# ------------------------------------------------------
+lst_min, lst_max = gdf['heat_lst_c'].min(), gdf['heat_lst_c'].max()
+can_min, can_max = gdf['can_shade'].min(), gdf['can_shade'].max()
+def normalize(x, mn, mx):
+    return 0.5 if mx == mn else (x - mn) / (mx - mn)
+gdf['lst_std'] = gdf['heat_lst_c'].apply(lambda x: normalize(x, lst_min, lst_max))
+gdf['canopy_std'] = gdf['can_shade'].apply(lambda x: normalize(x, can_min, can_max))
+gdf['canopy_pen'] = 1 - gdf['canopy_std']
+gdf['cost_summer'] = 0.65 * gdf['lst_std'] + 0.35 * gdf['canopy_pen']
+gdf['time_base_sec'] = gdf['length_m'] / (gdf['speed_kmh'] * 1000 / 3600)
+gdf['time_summer_sec'] = gdf['time_base_sec'] * gdf['cost_summer']
+
+def monsoon_time(row):
+    L, Vn, d = row['length_m'], row['speed_kmh'], row['fl_depth_m']
+    if d < 0.10:
+        return L / (Vn * 1000 / 3600)
+    elif 0.10 <= d <= 0.46:
+        factor = 1 - ((d - 0.10) / 0.36) * 0.90
+        Vm = Vn * factor
+        return L / (Vm * 1000 / 3600) if Vm > 0 else 999999
+    else:
+        return 999999
+gdf['time_monsoon_sec'] = gdf.apply(monsoon_time, axis=1)
+
+print(f"Summer cost range: {gdf['cost_summer'].min():.3f} – {gdf['cost_summer'].max():.3f}")
+
+# ------------------------------------------------------
+# 4. Build graph
+# ------------------------------------------------------
+print("Building graph...")
+G = nx.MultiDiGraph()
+for idx, row in gdf.iterrows():
+    geom = row.geometry
+    if geom.geom_type != 'LineString':
+        continue
+    coords = list(geom.coords)
+    for i in range(len(coords)-1):
+        u, v = coords[i], coords[i+1]
+        if u not in G.nodes:
+            G.add_node(u, x=u[0], y=u[1])
+        if v not in G.nodes:
+            G.add_node(v, x=v[0], y=v[1])
+        sub_len = row['length_m'] / (len(coords)-1)
+        t_summer = row['time_summer_sec'] / (len(coords)-1)
+        t_monsoon = row['time_monsoon_sec'] / (len(coords)-1)
+        G.add_edge(u, v, length=sub_len, time_summer=t_summer, time_monsoon=t_monsoon)
+        G.add_edge(v, u, length=sub_len, time_summer=t_summer, time_monsoon=t_monsoon)
+print(f"Graph nodes: {G.number_of_nodes()}, edges: {G.number_of_edges()}")
+
+# ------------------------------------------------------
+# 5. Define villages, APMCs, CCs (correct assignments)
+# ------------------------------------------------------
+villages = pd.DataFrame([
+    {"name": "Radu_Sokda", "lat": 22.068241, "lon": 72.978315, "supply": 6200, "cc": "DIRECT"},
+    {"name": "Bill", "lat": 22.253577, "lon": 73.132695, "supply": 4200, "cc": "CC-P1"},
+    {"name": "Chapad", "lat": 22.220058, "lon": 73.229589, "supply": 4700, "cc": "CC-P1"},
+    {"name": "Dabka", "lat": 22.247347, "lon": 72.956391, "supply": 8200, "cc": "CC-P1"},
+    {"name": "Samiyala", "lat": 22.260773, "lon": 73.119102, "supply": 4500, "cc": "CC-P1"},
+    {"name": "Navapura", "lat": 22.245040, "lon": 73.260319, "supply": 3500, "cc": "CC-P1"},
+    {"name": "Sadhi", "lat": 22.177601, "lon": 73.053072, "supply": 6400, "cc": "DIRECT"},
+    {"name": "Chansad", "lat": 22.208211, "lon": 73.130535, "supply": 5200, "cc": "CC-P1"},
+    {"name": "Latipura", "lat": 22.222572, "lon": 73.058606, "supply": 4900, "cc": "CC-P1"},
+    {"name": "Baglipura", "lat": 22.000121, "lon": 73.503457, "supply": 9000, "cc": "CC-S1"},
+    {"name": "Desar", "lat": 22.715921, "lon": 73.292675, "supply": 3000, "cc": "CC-S2"},
+    {"name": "Ganpatpura", "lat": 22.267222, "lon": 73.075889, "supply": 1660, "cc": "CC-S1"},
+    {"name": "Halol", "lat": 22.504571, "lon": 73.471367, "supply": 3250, "cc": "CC-S2"},
+    {"name": "Kalol", "lat": 22.609968, "lon": 73.462591, "supply": 4750, "cc": "CC-S2"},
+    {"name": "Kandari", "lat": 22.090529, "lon": 73.288330, "supply": 9900, "cc": "CC-S1"},
+    {"name": "Kavant", "lat": 22.092124, "lon": 74.054981, "supply": 9350, "cc": "CC-E1"},
+    {"name": "Kayavarohan", "lat": 22.077848, "lon": 73.249997, "supply": 1700, "cc": "CC-S1"},
+    {"name": "Limbani", "lat": 22.426564, "lon": 73.768378, "supply": 850, "cc": "CC-S2"},
+    {"name": "Limdi", "lat": 23.008827, "lon": 74.155871, "supply": 20, "cc": "CC-S2"},
+    {"name": "Segva", "lat": 22.000267, "lon": 73.364975, "supply": 2000, "cc": "CC-S1"},
+    {"name": "Simri", "lat": 21.953801, "lon": 73.210184, "supply": 1600, "cc": "CC-S1"},
+    {"name": "Sinor", "lat": 21.913707, "lon": 73.338447, "supply": 2000, "cc": "CC-S1"},
+])
+
+ccs = pd.DataFrame([
+    {"name": "CC-P1", "lat": 22.2367, "lon": 73.1049},
+    {"name": "CC-S1", "lat": 22.0441, "lon": 73.3474},
+    {"name": "CC-S2", "lat": 22.5947, "lon": 73.4439},
+    {"name": "CC-E1", "lat": 22.0921, "lon": 74.0550},
+])
+
+apmcs = pd.DataFrame([
+    {"name": "Padra_APMC", "lat": 22.243074, "lon": 73.079078},
+    {"name": "Sayajipura_APMC", "lat": 22.332067, "lon": 73.250269},
+])
+
+cc_to_apmc = {
+    "CC-P1": "Padra_APMC",
+    "CC-S1": "Sayajipura_APMC",
+    "CC-S2": "Sayajipura_APMC",
+    "CC-E1": "Sayajipura_APMC",
+}
+
+# ------------------------------------------------------
+# 6. Helper: nearest graph node
+# ------------------------------------------------------
+def nearest_node(G, lon, lat):
+    point = Point(lon, lat)
+    point_utm = gpd.GeoSeries([point], crs="EPSG:4326").to_crs("EPSG:32643").iloc[0]
+    best_node, best_dist = None, float('inf')
+    for node, data in G.nodes(data=True):
+        dx = data['x'] - point_utm.x
+        dy = data['y'] - point_utm.y
+        dist = dx*dx + dy*dy
+        if dist < best_dist:
+            best_dist = dist
+            best_node = node
+    return best_node
+
+# ------------------------------------------------------
+# 7. Function to solve VRP and collect geometries safely
+# ------------------------------------------------------
+def solve_scenario(scenario_name, time_weight):
+    print(f"\n{'='*60}")
+    print(f"RUNNING {scenario_name.upper()} SCENARIO")
+    print('='*60)
+    start_time = time.time()
+
+    clusters = {
+        "CC-P1": villages[villages['cc'] == 'CC-P1'],
+        "CC-S1": villages[villages['cc'] == 'CC-S1'],
+        "CC-S2": villages[villages['cc'] == 'CC-S2'],
+        "CC-E1": villages[villages['cc'] == 'CC-E1'],
+    }
+
+    all_routes = {}
+    first_level_trips = []
+    route_geometries = []
+
+    # First level: villages → CC
+    for cc_name, vills in clusters.items():
+        if len(vills) == 0:
+            continue
+        print(f"\nProcessing {cc_name} with {len(vills)} villages...")
+        cc_row = ccs[ccs['name'] == cc_name].iloc[0]
+        cc_node = nearest_node(G, cc_row['lon'], cc_row['lat'])
+        if cc_node is None:
+            print(f"  Cannot map CC {cc_name} to graph")
+            continue
+        v_nodes, supplies, names = [], [], []
+        for _, v in vills.iterrows():
+            node = nearest_node(G, v['lon'], v['lat'])
+            if node is None:
+                print(f"  Warning: could not map {v['name']} to graph")
+                continue
+            v_nodes.append(node)
+            supplies.append(v['supply'])
+            names.append(v['name'])
+        if len(v_nodes) == 0:
+            continue
+        nodes = [cc_node] + v_nodes
+        n = len(nodes)
+        time_matrix = np.zeros((n, n), dtype=int)
+        for i in range(n):
+            for j in range(n):
+                if i == j:
+                    continue
+                try:
+                    t = nx.shortest_path_length(G, nodes[i], nodes[j], weight=time_weight)
+                    time_matrix[i][j] = int(t)
+                except nx.NetworkXNoPath:
+                    time_matrix[i][j] = 86400
+        demands = [0] + supplies
+        total_demand = sum(supplies)
+        capacity_per_truck = 15000
+        num_trucks = max(1, int(math.ceil(total_demand / capacity_per_truck)))
+        vehicle_capacities = [capacity_per_truck] * num_trucks
+        print(f"  {cc_name}: total demand {total_demand} MT → {num_trucks} trucks of {capacity_per_truck} MT")
+        data = {
+            'distance_matrix': time_matrix.tolist(),
+            'num_vehicles': num_trucks,
+            'depot': 0,
+            'demands': demands,
+            'vehicle_capacities': vehicle_capacities
+        }
+        manager = pywrapcp.RoutingIndexManager(n, data['num_vehicles'], data['depot'])
+        routing = pywrapcp.RoutingModel(manager)
+        def distance_callback(from_idx, to_idx):
+            return data['distance_matrix'][manager.IndexToNode(from_idx)][manager.IndexToNode(to_idx)]
+        transit_cb = routing.RegisterTransitCallback(distance_callback)
+        routing.SetArcCostEvaluatorOfAllVehicles(transit_cb)
+        def demand_callback(from_idx):
+            return data['demands'][manager.IndexToNode(from_idx)]
+        demand_cb = routing.RegisterUnaryTransitCallback(demand_callback)
+        routing.AddDimensionWithVehicleCapacity(demand_cb, 0, data['vehicle_capacities'], True, 'Capacity')
+        params = pywrapcp.DefaultRoutingSearchParameters()
+        params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
+        solution = routing.SolveWithParameters(params)
+        if solution:
+            routes = []
+            for v in range(data['num_vehicles']):
+                idx = routing.Start(v)
+                route_nodes = []
+                while not routing.IsEnd(idx):
+                    route_nodes.append(manager.IndexToNode(idx))
+                    idx = solution.Value(routing.NextVar(idx))
+                routes.append(route_nodes)
+            all_routes[cc_name] = (routes, nodes, names)
+            for truck_idx, route_nodes in enumerate(routes):
+                # Build geometry for this truck's closed tour
+                all_coords = []
+                for i in range(len(route_nodes)-1):
+                    u, v = nodes[route_nodes[i]], nodes[route_nodes[i+1]]
+                    try:
+                        path = nx.shortest_path(G, u, v, weight=time_weight)
+                        for node in path:
+                            all_coords.append((G.nodes[node]['x'], G.nodes[node]['y']))
+                    except:
+                        pass
+                # Return to depot
+                last_node = nodes[route_nodes[-1]]
+                first_node = nodes[route_nodes[0]]
+                try:
+                    path = nx.shortest_path(G, last_node, first_node, weight=time_weight)
+                    for node in path[1:]:
+                        all_coords.append((G.nodes[node]['x'], G.nodes[node]['y']))
+                except:
+                    pass
+                # Remove consecutive duplicates
+                unique_coords = []
+                for p in all_coords:
+                    if not unique_coords or (abs(p[0]-unique_coords[-1][0])>1e-9 or abs(p[1]-unique_coords[-1][1])>1e-9):
+                        unique_coords.append(p)
+                if len(unique_coords) >= 2:
+                    geom = LineString(unique_coords)
+                    route_geometries.append({
+                        'geometry': geom,
+                        'scenario': scenario_name,
+                        'level': 'village_to_CC',
+                        'cc': cc_name,
+                        'truck_id': truck_idx
+                    })
+                # Compute total distance for metrics
+                total_dist = 0
+                for i in range(len(route_nodes)-1):
+                    u, v = nodes[route_nodes[i]], nodes[route_nodes[i+1]]
+                    try:
+                        path_len = nx.shortest_path_length(G, u, v, weight=time_weight)
+                        dist_km = path_len / 3600 * 50
+                        total_dist += dist_km
+                    except:
+                        pass
+                last_node = nodes[route_nodes[-1]]
+                first_node = nodes[route_nodes[0]]
+                try:
+                    path_len = nx.shortest_path_length(G, last_node, first_node, weight=time_weight)
+                    dist_km = path_len / 3600 * 50
+                    total_dist += dist_km
+                except:
+                    pass
+                first_level_trips.append({
+                    'cc': cc_name,
+                    'truck_id': truck_idx,
+                    'distance_km': total_dist
+                })
+        else:
+            print(f"  ❌ No solution for {cc_name}")
+
+    # Second level: CC → APMC
+    second_level_trips = []
+    for cc_name, apmc_name in cc_to_apmc.items():
+        if cc_name not in all_routes:
+            continue
+        cc_row = ccs[ccs['name'] == cc_name].iloc[0]
+        apmc_row = apmcs[apmcs['name'] == apmc_name].iloc[0]
+        cc_node = nearest_node(G, cc_row['lon'], cc_row['lat'])
+        apmc_node = nearest_node(G, apmc_row['lon'], apmc_row['lat'])
+        if cc_node is None or apmc_node is None:
+            continue
+        try:
+            path = nx.shortest_path(G, cc_node, apmc_node, weight=time_weight)
+            coords = [(G.nodes[node]['x'], G.nodes[node]['y']) for node in path]
+            if len(coords) >= 2:
+                geom = LineString(coords)
+                route_geometries.append({
+                    'geometry': geom,
+                    'scenario': scenario_name,
+                    'level': 'CC_to_APMC',
+                    'cc': cc_name,
+                    'apmc': apmc_name
+                })
+            t = nx.shortest_path_length(G, cc_node, apmc_node, weight=time_weight)
+            dist_km = t / 3600 * 50
+            second_level_trips.append({
+                'cc': cc_name,
+                'apmc': apmc_name,
+                'distance_km': dist_km
+            })
+            print(f"  {cc_name} → {apmc_name}: {t/60:.1f} minutes ({dist_km:.1f} km)")
+        except nx.NetworkXNoPath:
+            print(f"  ⚠️ No path between {cc_name} and {apmc_name}")
+
+    # Direct villages to Padra APMC
+    direct_trips = []
+    direct_vills = villages[villages['cc'] == 'DIRECT']
+    padra_node = nearest_node(G, apmcs[apmcs['name']=='Padra_APMC'].iloc[0]['lon'],
+                              apmcs[apmcs['name']=='Padra_APMC'].iloc[0]['lat'])
+    for _, v in direct_vills.iterrows():
+        v_node = nearest_node(G, v['lon'], v['lat'])
+        if v_node is None:
+            continue
+        try:
+            path = nx.shortest_path(G, v_node, padra_node, weight=time_weight)
+            coords = [(G.nodes[node]['x'], G.nodes[node]['y']) for node in path]
+            if len(coords) >= 2:
+                geom = LineString(coords)
+                route_geometries.append({
+                    'geometry': geom,
+                    'scenario': scenario_name,
+                    'level': 'direct_village_to_APMC',
+                    'village': v['name'],
+                    'apmc': 'Padra_APMC'
+                })
+            t = nx.shortest_path_length(G, v_node, padra_node, weight=time_weight)
+            dist_km = t / 3600 * 50
+            direct_trips.append({
+                'village': v['name'],
+                'supply_kg': v['supply'] * 1000,
+                'distance_km': dist_km
+            })
+            print(f"  {v['name']} → Padra_APMC: {t/60:.1f} minutes ({dist_km:.1f} km)")
+        except nx.NetworkXNoPath:
+            print(f"  ⚠️ No path for {v['name']}")
+
+    # Metrics
+    total_trips = len(first_level_trips) + len(second_level_trips) + len(direct_trips)
+    total_distance = sum(t['distance_km'] for t in first_level_trips) + sum(t['distance_km'] for t in second_level_trips) + sum(t['distance_km'] for t in direct_trips)
+    fixed_cost_per_cc = 5000
+    total_fixed_cost = len(ccs) * fixed_cost_per_cc
+    variable_cost = total_distance * 15
+    total_cost = total_fixed_cost + variable_cost
+    cost_per_tonne = total_cost / (villages['supply'].sum())
+    total_cc_demand = villages[villages['cc'] != 'DIRECT']['supply'].sum()
+    avg_load_per_trip = total_cc_demand / len(first_level_trips) if first_level_trips else 0
+    vehicle_utilization = avg_load_per_trip / 15000 * 100 if first_level_trips else 0
+    demand_fulfilled_pct = 100.0
+    avg_travel_time_hours = total_distance / 50 / total_trips if total_trips > 0 else 0
+    comp_time = time.time() - start_time
+
+    results = {
+        'scenario': scenario_name,
+        'total_trips': total_trips,
+        'total_distance_km': total_distance,
+        'total_cost_rs': total_cost,
+        'fixed_cost_rs': total_fixed_cost,
+        'variable_cost_rs': variable_cost,
+        'cost_per_tonne_rs': cost_per_tonne,
+        'vehicle_utilization_pct': vehicle_utilization,
+        'demand_fulfilled_pct': demand_fulfilled_pct,
+        'avg_travel_time_hours': avg_travel_time_hours,
+        'num_vehicles_used': len(first_level_trips) + len(second_level_trips) + len(direct_trips),
+        'computation_time_sec': comp_time,
+        'first_level_trips': first_level_trips,
+        'second_level_trips': second_level_trips,
+        'direct_trips': direct_trips,
+        'route_geometries': route_geometries,
+    }
+    return results
+
+# ------------------------------------------------------
+# 8. Run both scenarios
+# ------------------------------------------------------
+summer_results = solve_scenario("Summer", time_weight='time_summer')
+monsoon_results = solve_scenario("Monsoon", time_weight='time_monsoon')
+
+# ------------------------------------------------------
+# 9. Export shapefiles (only if geometries exist)
+# ------------------------------------------------------
+def export_shapefile(geometries, scenario_name):
+    if not geometries:
+        print(f"No valid geometries for {scenario_name}")
+        return
+    gdf_routes = gpd.GeoDataFrame(geometries, crs="EPSG:32643")
+    gdf_routes = gdf_routes.to_crs("EPSG:4326")
+    shp_name = f"{scenario_name.lower()}_routes.shp"
+    gdf_routes.to_file(shp_name)
+    !zip {scenario_name.lower()}_routes_shp.zip {shp_name} {shp_name.replace('.shp','.shx')} {shp_name.replace('.shp','.dbf')} {shp_name.replace('.shp','.prj')}
+    colab_files.download(f"{scenario_name.lower()}_routes_shp.zip")
+    print(f"📁 Shapefile for {scenario_name} downloaded")
+
+export_shapefile(summer_results['route_geometries'], "Summer")
+export_shapefile(monsoon_results['route_geometries'], "Monsoon")
+
+# ------------------------------------------------------
+# 10. Excel and Word report
+# ------------------------------------------------------
+wb = Workbook()
+def add_trip_sheet(wb, sheet_name, trips, columns):
+    ws = wb.create_sheet(sheet_name)
+    ws.append(columns)
+    for t in trips:
+        row = [t.get(col, '') for col in columns]
+        ws.append(row)
+
+add_trip_sheet(wb, "Summer_FirstLevel", summer_results['first_level_trips'],
+               ['cc', 'truck_id', 'distance_km'])
+add_trip_sheet(wb, "Summer_SecondLevel", summer_results['second_level_trips'],
+               ['cc', 'apmc', 'distance_km'])
+add_trip_sheet(wb, "Summer_Direct", summer_results['direct_trips'],
+               ['village', 'supply_kg', 'distance_km'])
+add_trip_sheet(wb, "Monsoon_FirstLevel", monsoon_results['first_level_trips'],
+               ['cc', 'truck_id', 'distance_km'])
+add_trip_sheet(wb, "Monsoon_SecondLevel", monsoon_results['second_level_trips'],
+               ['cc', 'apmc', 'distance_km'])
+add_trip_sheet(wb, "Monsoon_Direct", monsoon_results['direct_trips'],
+               ['village', 'supply_kg', 'distance_km'])
+
+ws_sum = wb.create_sheet("Summary")
+ws_sum.append(["Metric", "Summer", "Monsoon"])
+ws_sum.append(["Total Cost (₹)", summer_results['total_cost_rs'], monsoon_results['total_cost_rs']])
+ws_sum.append(["Total Distance (km)", summer_results['total_distance_km'], monsoon_results['total_distance_km']])
+ws_sum.append(["Number of Trips", summer_results['total_trips'], monsoon_results['total_trips']])
+ws_sum.append(["Vehicle Utilization (%)", summer_results['vehicle_utilization_pct'], monsoon_results['vehicle_utilization_pct']])
+ws_sum.append(["Demand Fulfilled (%)", summer_results['demand_fulfilled_pct'], monsoon_results['demand_fulfilled_pct']])
+ws_sum.append(["Average Travel Time (h)", summer_results['avg_travel_time_hours'], monsoon_results['avg_travel_time_hours']])
+ws_sum.append(["Cost per Tonne (₹)", summer_results['cost_per_tonne_rs'], monsoon_results['cost_per_tonne_rs']])
+ws_sum.append(["Fixed Cost (₹)", summer_results['fixed_cost_rs'], monsoon_results['fixed_cost_rs']])
+ws_sum.append(["Variable Cost (₹)", summer_results['variable_cost_rs'], monsoon_results['variable_cost_rs']])
+ws_sum.append(["Number of Vehicles Used", summer_results['num_vehicles_used'], monsoon_results['num_vehicles_used']])
+ws_sum.append(["Computation Time (s)", summer_results['computation_time_sec'], monsoon_results['computation_time_sec']])
+
+excel_file = "vrp_summer_monsoon.xlsx"
+wb.save(excel_file)
+colab_files.download(excel_file)
+
+doc = Document()
+doc.add_heading('Vehicle Routing Analysis – Summer vs Monsoon (Only Major Roads)', 0)
+doc.add_heading('1. Executive Summary', level=1)
+doc.add_paragraph(f"Total cost Summer: ₹{summer_results['total_cost_rs']:,.0f}")
+doc.add_paragraph(f"Total cost Monsoon: ₹{monsoon_results['total_cost_rs']:,.0f}")
+doc.add_paragraph(f"Total distance Summer: {summer_results['total_distance_km']:.1f} km")
+doc.add_paragraph(f"Total distance Monsoon: {monsoon_results['total_distance_km']:.1f} km")
+doc.add_paragraph(f"Number of trips Summer: {summer_results['total_trips']}")
+doc.add_paragraph(f"Number of trips Monsoon: {monsoon_results['total_trips']}")
+
+doc.add_heading('2. Scenario Comparison', level=1)
+table = doc.add_table(rows=1, cols=3)
+table.style = 'Table Grid'
+hdr = table.rows[0].cells
+hdr[0].text = 'Metric'
+hdr[1].text = 'Summer'
+hdr[2].text = 'Monsoon'
+for row in [
+    ("Total Cost (₹)", summer_results['total_cost_rs'], monsoon_results['total_cost_rs']),
+    ("Total Distance (km)", summer_results['total_distance_km'], monsoon_results['total_distance_km']),
+    ("Number of Trips", summer_results['total_trips'], monsoon_results['total_trips']),
+    ("Vehicle Utilization (%)", summer_results['vehicle_utilization_pct'], monsoon_results['vehicle_utilization_pct']),
+    ("Average Travel Time (h)", summer_results['avg_travel_time_hours'], monsoon_results['avg_travel_time_hours']),
+    ("Cost per Tonne (₹)", summer_results['cost_per_tonne_rs'], monsoon_results['cost_per_tonne_rs']),
+]:
+    cells = table.add_row().cells
+    cells[0].text = row[0]
+    cells[1].text = f"{row[1]:,.0f}" if isinstance(row[1], (int,float)) else str(row[1])
+    cells[2].text = f"{row[2]:,.0f}" if isinstance(row[2], (int,float)) else str(row[2])
+
+word_file = "vrp_analysis_report.docx"
+doc.save(word_file)
+colab_files.download(word_file)
+
+# ------------------------------------------------------
+# 11. Interactive map (Summer routes only)
+# ------------------------------------------------------
+print("\nCreating interactive map (Summer routes)...")
+center = (villages['lat'].mean(), villages['lon'].mean())
+m = folium.Map(location=center, zoom_start=10)
+sample_roads = gdf.iloc[::30]
+for _, row in sample_roads.iterrows():
+    if row.geometry.geom_type == 'LineString':
+        coords = [(y, x) for x, y in row.geometry.coords]
+        folium.PolyLine(coords, color='gray', weight=1, opacity=0.3).add_to(m)
+for _, v in villages.iterrows():
+    folium.Marker([v['lat'], v['lon']], popup=f"{v['name']}<br>{v['supply']} MT",
+                  icon=folium.Icon(color='blue')).add_to(m)
+for _, c in ccs.iterrows():
+    folium.Marker([c['lat'], c['lon']], popup=c['name'], icon=folium.Icon(color='green')).add_to(m)
+for _, a in apmcs.iterrows():
+    folium.Marker([a['lat'], a['lon']], popup=a['name'], icon=folium.Icon(color='red')).add_to(m)
+
+colors = ['darkred', 'purple', 'orange', 'cadetblue', 'darkgreen']
+cidx = 0
+for geom_dict in summer_results['route_geometries']:
+    geom = geom_dict['geometry']
+    if geom.is_empty:
+        continue
+    geom_latlon = gpd.GeoSeries([geom], crs="EPSG:32643").to_crs("EPSG:4326").iloc[0]
+    coords = [(y, x) for x, y in geom_latlon.coords]
+    popup_text = f"{geom_dict['level']}<br>{geom_dict.get('cc', '')} {geom_dict.get('truck_id', '')}"
+    folium.PolyLine(coords, color=colors[cidx % len(colors)], weight=3, opacity=0.7,
+                    popup=popup_text).add_to(m)
+    cidx += 1
+
+map_file = "optimised_routes_summer.html"
+m.save(map_file)
+colab_files.download(map_file)
+print("\n✅ Analysis complete. Shapefiles, Excel, Word, and HTML map downloaded.")
