@@ -1,0 +1,457 @@
+/ ============================================================
+// LST & SLOPE MAP — Gujarat Study Area  [v2 — High Resolution]
+// LST Source  : Landsat 8 + 9 (30 m) — Summer 2025
+// Slope Source: SRTM 30 m DEM
+// Roads       : projects/plannerharsh2025/assets/roadvadodara
+// Output      : LST map, Slope map, Roads with LST values (export)
+// ============================================================
+
+// ── 1. STUDY AREA ───────────────────────────────────────────
+var geometry = ee.Geometry.Polygon(
+  [[[72.71984474747383, 23.55400466809003],
+    [72.71984474747383, 21.54515550688744],
+    [74.48864357559883, 21.54515550688744],
+    [74.48864357559883, 23.55400466809003]]], null, false);
+
+Map.centerObject(geometry, 9);
+Map.setOptions('HYBRID');   // Satellite + labels basemap
+
+// ── 2. USER ROAD ASSET ──────────────────────────────────────
+var roads = ee.FeatureCollection('projects/plannerharsh2025/assets/roadvadodara')
+              .filterBounds(geometry);
+
+print('Road features loaded:', roads.size());
+print('Road schema (first feature):', roads.first());
+
+
+// ============================================================
+// SECTION A — HIGH-RESOLUTION LST  (Landsat 8 + 9, 30 m)
+// Summer 2025 = April 1 – June 30 2025
+// Method: Mono-window algorithm using Band 10 (TIRS)
+// ============================================================
+
+var startDate = '2025-04-01';
+var endDate   = '2025-06-30';
+
+// ── A1. Cloud-mask function for Landsat Collection 2 ────────
+function maskL8Clouds(image) {
+  var qa = image.select('QA_PIXEL');
+  var cloudBitMask  = (1 << 3);
+  var cirrusBitMask = (1 << 2);
+  var shadowBitMask = (1 << 4);
+  var mask = qa.bitwiseAnd(cloudBitMask).eq(0)
+              .and(qa.bitwiseAnd(shadowBitMask).eq(0))
+              .and(qa.bitwiseAnd(cirrusBitMask).eq(0));
+  return image.updateMask(mask);
+}
+
+// ── A2. Load Landsat 8 + 9 Collection 2 Surface Reflectance ─
+var L8 = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
+  .filterDate(startDate, endDate)
+  .filterBounds(geometry)
+  .map(maskL8Clouds);
+
+var L9 = ee.ImageCollection('LANDSAT/LC09/C02/T1_L2')
+  .filterDate(startDate, endDate)
+  .filterBounds(geometry)
+  .map(maskL8Clouds);
+
+var landsatCol = L8.merge(L9);
+print('Landsat scenes used (L8+L9):', landsatCol.size());
+
+// ── A3. LST Computation Function ────────────────────────────
+// Steps: NDVI → FVC → Emissivity → Brightness Temp → LST
+function computeLST(image) {
+
+  // Scale SR bands (Landsat C2 scale factor)
+  var optical = image.select(['SR_B4','SR_B5'])
+                     .multiply(0.0000275).add(-0.2);
+
+  var red  = optical.select('SR_B4');
+  var nir  = optical.select('SR_B5');
+
+  // NDVI
+  var ndvi = nir.subtract(red).divide(nir.add(red)).rename('NDVI');
+
+  // Fractional Vegetation Cover (FVC)
+  var ndviMin = ee.Number(0.2);
+  var ndviMax = ee.Number(0.86);
+  var fvc = ndvi.subtract(ndviMin)
+                .divide(ndviMax.subtract(ndviMin))
+                .pow(2)
+                .clamp(0, 1)
+                .rename('FVC');
+
+  // Land Surface Emissivity (LSE)
+  // ε = 0.004 × FVC + 0.986
+  var lse = fvc.multiply(0.004).add(0.986).rename('LSE');
+
+  // Brightness Temperature from Band 10 (TIRS1)
+  // Landsat C2 thermal: scale = 0.00341802, offset = 149.0
+  var thermal = image.select('ST_B10')
+                     .multiply(0.00341802)
+                     .add(149.0)
+                     .rename('BT_K');
+
+  // Planck constant for Landsat Band 10 (λ = 10.8 µm)
+  var lambda = 10.895e-6;  // central wavelength in meters
+  var rho    = 1.438e-2;   // h*c/k  (m·K)
+
+  // LST (Kelvin) using Planck inversion with emissivity correction
+  // LST = BT / [1 + (λ × BT / ρ) × ln(ε)]
+  var lstK = thermal.expression(
+    'BT / (1 + (lambda * BT / rho) * log(lse))', {
+      'BT'    : thermal,
+      'lambda': lambda,
+      'rho'   : rho,
+      'lse'   : lse
+    }
+  );
+
+  // Kelvin → Celsius
+  var lstC = lstK.subtract(273.15).rename('LST_C');
+
+  return lstC.copyProperties(image, ['system:time_start']);
+}
+
+// ── A4. Apply & Composite ────────────────────────────────────
+var lstCollection = landsatCol.map(computeLST);
+var lstMean       = lstCollection.mean().clip(geometry).rename('LST_C');
+var lstMax        = lstCollection.max().clip(geometry).rename('LST_C_Max');
+
+// ── A5. Visualization ────────────────────────────────────────
+var lstVis = {
+  min    : 25,
+  max    : 58,
+  palette: [
+    '#053061','#2166ac','#4393c3','#92c5de',
+    '#d1e5f0','#fddbc7','#f4a582','#d6604d',
+    '#b2182b','#67001f'
+  ]
+};
+
+Map.addLayer(lstMean, lstVis, '🌡 Mean LST — Summer 2025 (°C, 30 m)');
+Map.addLayer(lstMax,  lstVis, '🔥 Max LST — Summer 2025 (°C, 30 m)', false);
+
+// ── A6. LST Legend ───────────────────────────────────────────
+var lstLegend = ui.Panel({
+  style: {position:'bottom-left', padding:'8px 15px', backgroundColor:'#ffffffcc'}
+});
+lstLegend.add(ui.Label('🌡 Mean LST — Summer 2025 (°C)',
+  {fontWeight:'bold', fontSize:'12px', margin:'0 0 4px 0'}));
+var lstGrad = ui.Thumbnail({
+  image : ee.Image.pixelLonLat().select('longitude'),
+  params: {bbox:[0,0,1,0.1], dimensions:'220x18', format:'png',
+           min:0, max:1, palette:lstVis.palette},
+  style : {stretch:'horizontal', margin:'0 4px', height:'18px'}
+});
+lstLegend.add(lstGrad);
+lstLegend.add(ui.Panel({
+  widgets:[
+    ui.Label('25°C',{fontSize:'10px'}),
+    ui.Label('',{stretch:'horizontal'}),
+    ui.Label('58°C',{fontSize:'10px'})
+  ],
+  layout: ui.Panel.Layout.flow('horizontal')
+}));
+Map.add(lstLegend);
+
+
+// ============================================================
+// SECTION B — SLOPE MAP (percentage, SRTM 30 m)
+// ============================================================
+
+var srtm     = ee.Image('USGS/SRTMGL1_003').clip(geometry);
+var slopeDeg = ee.Terrain.slope(srtm);
+var slopePct = slopeDeg.multiply(Math.PI / 180).tan()
+                       .multiply(100).rename('slope_pct');
+
+var slopeVis = {
+  min    : 0,
+  max    : 30,
+  palette: ['#f7fcf0','#ccebc5','#a8ddb5','#7bccc4',
+            '#4eb3d3','#2b8cbe','#0868ac','#084081']
+};
+
+Map.addLayer(slopePct, slopeVis, '⛰ Slope (%)');
+
+// Slope legend
+var slopeLegend = ui.Panel({
+  style: {position:'bottom-right', padding:'8px 15px', backgroundColor:'#ffffffcc'}
+});
+slopeLegend.add(ui.Label('⛰ Slope (%)',
+  {fontWeight:'bold', fontSize:'12px', margin:'0 0 4px 0'}));
+var slopeGrad = ui.Thumbnail({
+  image : ee.Image.pixelLonLat().select('longitude'),
+  params: {bbox:[0,0,1,0.1], dimensions:'220x18', format:'png',
+           min:0, max:1, palette:slopeVis.palette},
+  style : {stretch:'horizontal', margin:'0 4px', height:'18px'}
+});
+slopeLegend.add(slopeGrad);
+slopeLegend.add(ui.Panel({
+  widgets:[
+    ui.Label('0%',  {fontSize:'10px'}),
+    ui.Label('',    {stretch:'horizontal'}),
+    ui.Label('30%', {fontSize:'10px'})
+  ],
+  layout: ui.Panel.Layout.flow('horizontal')
+}));
+Map.add(slopeLegend);
+
+
+// ============================================================
+// SECTION C — EXTRACT LST + SLOPE VALUES TO ROAD SEGMENTS
+// Buffer each road by 30 m (1 Landsat pixel) → zonal stats
+// Attributes added:
+//   lst_mean   — mean summer LST (°C) along road
+//   lst_max    — peak LST (°C) along road
+//   lst_min    — minimum LST (°C) along road
+//   slope_mean — mean slope (%) along road
+//   heat_class — categorical (LOW / MED / HIGH / EXTREME)
+// ============================================================
+
+var lstMaxBand  = lstCollection.max().clip(geometry).rename('LST_C_Max');
+var lstMinBand  = lstCollection.min().clip(geometry).rename('LST_C_Min');
+
+// Stack all bands for single reduceRegion call
+var lstStack = lstMean.rename('lst_mean')
+  .addBands(lstMaxBand.rename('lst_max'))
+  .addBands(lstMinBand.rename('lst_min'))
+  .addBands(slopePct.rename('slope_pct'));
+
+// Function to extract zonal values per road feature
+var roadsWithValues = roads.map(function(feat) {
+  var buf = feat.buffer(30);   // 30 m buffer = 1 Landsat pixel width
+
+  var stats = lstStack.reduceRegion({
+    reducer  : ee.Reducer.mean(),
+    geometry : buf.geometry(),
+    scale    : 30,
+    maxPixels: 1e9,
+    bestEffort: true
+  });
+
+  var lstMeanVal = ee.Number(stats.get('lst_mean'));
+  var lstMaxVal  = ee.Number(stats.get('lst_max'));
+  var lstMinVal  = ee.Number(stats.get('lst_min'));
+  var slopeVal   = ee.Number(stats.get('slope_pct'));
+
+  // Thermal discomfort classification
+  var heatClass = ee.Algorithms.If(
+    lstMeanVal.gt(50), 'EXTREME',
+    ee.Algorithms.If(
+      lstMeanVal.gt(44), 'HIGH',
+      ee.Algorithms.If(
+        lstMeanVal.gt(38), 'MEDIUM', 'LOW'
+      )
+    )
+  );
+
+  return feat.set({
+    'lst_mean'  : lstMeanVal.format('%.2f'),
+    'lst_max'   : lstMaxVal.format('%.2f'),
+    'lst_min'   : lstMinVal.format('%.2f'),
+    'slope_pct' : slopeVal.format('%.2f'),
+    'heat_class': heatClass
+  });
+});
+
+print('Roads with LST values (first feature):', roadsWithValues.first());
+
+
+// ── C1. Styled Road Layers by Heat Class ───────────────────
+var extreme = roadsWithValues.filter(ee.Filter.eq('heat_class', 'EXTREME'));
+var high    = roadsWithValues.filter(ee.Filter.eq('heat_class', 'HIGH'));
+var medium  = roadsWithValues.filter(ee.Filter.eq('heat_class', 'MEDIUM'));
+var low     = roadsWithValues.filter(ee.Filter.eq('heat_class', 'LOW'));
+
+Map.addLayer(low,     {color:'2166ac', width:2}, '🔵 Roads — LOW LST (<38°C)');
+Map.addLayer(medium,  {color:'f4a600', width:2}, '🟡 Roads — MEDIUM LST (38–44°C)');
+Map.addLayer(high,    {color:'d62828', width:2}, '🔴 Roads — HIGH LST (44–50°C)');
+Map.addLayer(extreme, {color:'67001f', width:3}, '🟣 Roads — EXTREME LST (>50°C)');
+
+// ── C2. Road Heat Legend ────────────────────────────────────
+var roadLegend = ui.Panel({
+  style: {position:'top-left', padding:'8px 12px', backgroundColor:'#ffffffdd', width:'210px'}
+});
+roadLegend.add(ui.Label('🛣 Road Thermal Discomfort',
+  {fontWeight:'bold', fontSize:'12px', margin:'0 0 6px 0'}));
+
+var classes = [
+  {color:'#2166ac', label:'LOW  (<38°C)'},
+  {color:'#f4a600', label:'MEDIUM  (38–44°C)'},
+  {color:'#d62828', label:'HIGH  (44–50°C)'},
+  {color:'#67001f', label:'EXTREME  (>50°C)'}
+];
+
+classes.forEach(function(c) {
+  roadLegend.add(ui.Panel({
+    widgets:[
+      ui.Label('', {backgroundColor:c.color,
+                    padding:'0px', margin:'5px 6px',
+                    width:'16px', height:'16px'}),
+      ui.Label(c.label, {fontSize:'11px', margin:'3px 0'})
+    ],
+    layout: ui.Panel.Layout.flow('horizontal')
+  }));
+});
+Map.add(roadLegend);
+
+
+// ============================================================
+// SECTION D — STATISTICS PANEL
+// ============================================================
+var statsPanel = ui.Panel({
+  style:{position:'top-right', padding:'8px 12px',
+         backgroundColor:'#ffffffdd', width:'230px'}
+});
+statsPanel.add(ui.Label('📊 Region Statistics',
+  {fontWeight:'bold', fontSize:'13px', margin:'0 0 6px 0'}));
+
+var lstStats = lstMean.reduceRegion({
+  reducer  : ee.Reducer.minMax().combine(ee.Reducer.mean(), null, true),
+  geometry : geometry,
+  scale    : 30,
+  maxPixels: 1e10,
+  bestEffort: true
+});
+
+lstStats.evaluate(function(s) {
+  statsPanel.add(ui.Label('LST (Landsat 30 m, Summer 2025)',
+    {fontWeight:'bold', fontSize:'11px', margin:'4px 0 2px 0'}));
+  statsPanel.add(ui.Label('Min:  ' + s['LST_C_min'].toFixed(1) + ' °C',  {fontSize:'11px'}));
+  statsPanel.add(ui.Label('Max:  ' + s['LST_C_max'].toFixed(1) + ' °C',  {fontSize:'11px'}));
+  statsPanel.add(ui.Label('Mean: ' + s['LST_C_mean'].toFixed(1) + ' °C', {fontSize:'11px'}));
+});
+
+var slopeStats = slopePct.reduceRegion({
+  reducer  : ee.Reducer.minMax().combine(ee.Reducer.mean(), null, true),
+  geometry : geometry,
+  scale    : 30,
+  maxPixels: 1e10,
+  bestEffort: true
+});
+
+slopeStats.evaluate(function(s) {
+  statsPanel.add(ui.Label('Slope (SRTM 30 m)',
+    {fontWeight:'bold', fontSize:'11px', margin:'8px 0 2px 0'}));
+  statsPanel.add(ui.Label('Min:  ' + s['slope_pct_min'].toFixed(1) + ' %',  {fontSize:'11px'}));
+  statsPanel.add(ui.Label('Max:  ' + s['slope_pct_max'].toFixed(1) + ' %',  {fontSize:'11px'}));
+  statsPanel.add(ui.Label('Mean: ' + s['slope_pct_mean'].toFixed(1) + ' %', {fontSize:'11px'}));
+});
+
+Map.add(statsPanel);
+
+
+// ============================================================
+// SECTION E — EXPORT TASKS (run from Tasks panel)
+// All exports go to Google Drive → folder: GEE_LST_Gujarat
+// ============================================================
+
+// ── E1. Export Mean LST (GeoTIFF, 30 m) ────────────────────
+Export.image.toDrive({
+  image          : lstMean,
+  description    : 'LST_Mean_Summer2025_30m',
+  folder         : 'GEE_LST_Gujarat',
+  fileNamePrefix : 'LST_Mean_Summer2025_30m',
+  region         : geometry,
+  scale          : 30,
+  crs            : 'EPSG:4326',
+  maxPixels      : 1e13,
+  fileFormat     : 'GeoTIFF'
+});
+
+// ── E2. Export Max LST (GeoTIFF, 30 m) ─────────────────────
+Export.image.toDrive({
+  image          : lstMaxBand,
+  description    : 'LST_Max_Summer2025_30m',
+  folder         : 'GEE_LST_Gujarat',
+  fileNamePrefix : 'LST_Max_Summer2025_30m',
+  region         : geometry,
+  scale          : 30,
+  crs            : 'EPSG:4326',
+  maxPixels      : 1e13,
+  fileFormat     : 'GeoTIFF'
+});
+
+// ── E3. Export Slope % (GeoTIFF, 30 m) ─────────────────────
+Export.image.toDrive({
+  image          : slopePct,
+  description    : 'Slope_Pct_30m',
+  folder         : 'GEE_LST_Gujarat',
+  fileNamePrefix : 'Slope_Pct_30m',
+  region         : geometry,
+  scale          : 30,
+  crs            : 'EPSG:4326',
+  maxPixels      : 1e13,
+  fileFormat     : 'GeoTIFF'
+});
+
+// ── E4. Export Roads Shapefile with LST values ──────────────
+Export.table.toDrive({
+  collection     : roadsWithValues,
+  description    : 'Roads_LST_Values_Shapefile',
+  folder         : 'GEE_LST_Gujarat',
+  fileNamePrefix : 'Roads_LST_ThermalDiscomfort',
+  fileFormat     : 'SHP'           // → .shp, .dbf, .prj, .shx (zipped)
+});
+
+// ── E5. Export Roads as CSV (easy to open in Excel/QGIS) ────
+Export.table.toDrive({
+  collection     : roadsWithValues,
+  description    : 'Roads_LST_Values_CSV',
+  folder         : 'GEE_LST_Gujarat',
+  fileNamePrefix : 'Roads_LST_ThermalDiscomfort',
+  fileFormat     : 'CSV'
+});
+
+// ── E6. Export Roads as GeoJSON ─────────────────────────────
+Export.table.toDrive({
+  collection     : roadsWithValues,
+  description    : 'Roads_LST_Values_GeoJSON',
+  folder         : 'GEE_LST_Gujarat',
+  fileNamePrefix : 'Roads_LST_ThermalDiscomfort',
+  fileFormat     : 'GeoJSON'
+});
+
+// ── E7. Export LST as PNG map tile (for reports) ────────────
+Export.image.toDrive({
+  image          : lstMean.visualize(lstVis),
+  description    : 'LST_Map_PNG_Report',
+  folder         : 'GEE_LST_Gujarat',
+  fileNamePrefix : 'LST_Map_Summer2025_Visual',
+  region         : geometry,
+  scale          : 30,
+  crs            : 'EPSG:4326',
+  maxPixels      : 1e13,
+  fileFormat     : 'GeoTIFF'   // still georeferenced PNG-like visual
+});
+
+// ── E8. Export Slope as PNG visual ──────────────────────────
+Export.image.toDrive({
+  image          : slopePct.visualize(slopeVis),
+  description    : 'Slope_Map_PNG_Report',
+  folder         : 'GEE_LST_Gujarat',
+  fileNamePrefix : 'Slope_Map_Visual',
+  region         : geometry,
+  scale          : 30,
+  crs            : 'EPSG:4326',
+  maxPixels      : 1e13,
+  fileFormat     : 'GeoTIFF'
+});
+
+
+// ============================================================
+// CONSOLE
+// ============================================================
+print('--- EXPORT QUEUE ---');
+print('E1: LST Mean GeoTIFF (30m)');
+print('E2: LST Max GeoTIFF (30m)');
+print('E3: Slope % GeoTIFF (30m)');
+print('E4: Roads Shapefile (SHP) with lst_mean, lst_max, lst_min, slope_pct, heat_class');
+print('E5: Roads CSV with same attributes');
+print('E6: Roads GeoJSON');
+print('E7: LST visual map (GeoTIFF)');
+print('E8: Slope visual map (GeoTIFF)');
+print('All files → Google Drive → GEE_LST_Gujarat folder');
+print('Click Tasks tab (top-right) → Run each task');
